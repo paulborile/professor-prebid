@@ -7,12 +7,17 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 )
+
+// version is the semantic version of the prof-prebid CLI.
+// Bump following semver (MAJOR.MINOR.PATCH) on every release.
+const version = "0.1.0"
 
 const safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"
 
@@ -102,37 +107,19 @@ func extractEndpoint(s2s any) string {
 	}
 }
 
-func main() {
-	timeout := flag.Duration("timeout", 30*time.Second, "Page load timeout")
-	outputJSON := flag.Bool("json", false, "Output raw JSON")
-	headed := flag.Bool("headed", false, "Run with a visible browser window (bypasses stricter bot detection)")
-	wait := flag.Duration("wait", 6*time.Second, "Time to wait after page load for ad scripts to initialise")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: prof-prebid [flags] <url>\n\nFlags:\n")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(1)
-	}
-	url := flag.Arg(0)
-
+// fetchResults launches a browser (headed or not) and returns the extracted s2sConfig results.
+func fetchResults(url string, headed bool, wait, timeout time.Duration) ([]S2SResult, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.UserAgent(safariUA),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("ignore-certificate-errors", true),
-		// Reduce bot-detection fingerprinting
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 	)
-	if *headed {
-		// Visible window: most bot-detection bypassed naturally
+	if headed {
 		opts = append(opts, chromedp.Flag("headless", false))
 	} else {
-		// Use Chrome's newer headless implementation, harder to fingerprint than the old one
 		opts = append(opts, chromedp.Flag("headless", "new"))
 	}
 
@@ -142,11 +129,9 @@ func main() {
 	ctx, cancelCtx := chromedp.NewContext(allocCtx, chromedp.WithLogf(log.Printf))
 	defer cancelCtx()
 
-	ctx, cancelTimeout := context.WithTimeout(ctx, *timeout)
+	ctx, cancelTimeout := context.WithTimeout(ctx, timeout)
 	defer cancelTimeout()
 
-	// Inject anti-detection patches before any page script runs.
-	// Covers the most common headless tells: navigator.webdriver, screen dimensions, plugins.
 	antiDetectAction := chromedp.ActionFunc(func(ctx context.Context) error {
 		_, err := page.AddScriptToEvaluateOnNewDocument(`
 			Object.defineProperty(navigator, 'webdriver',    {get: () => undefined});
@@ -164,28 +149,68 @@ func main() {
 		return err
 	})
 
-	// Set a realistic viewport so innerWidth/innerHeight reported by Chrome itself match.
 	setViewport := chromedp.ActionFunc(func(ctx context.Context) error {
 		return emulation.SetDeviceMetricsOverride(1920, 1080, 1.0, false).Do(ctx)
 	})
 
 	var raw string
-	err := chromedp.Run(ctx,
+	if err := chromedp.Run(ctx,
 		antiDetectAction,
 		chromedp.Navigate(url),
 		setViewport,
-		chromedp.Sleep(*wait),
+		chromedp.Sleep(wait),
 		chromedp.Evaluate(extractScript, &raw),
-	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+	); err != nil {
+		return nil, err
 	}
 
 	var results []S2SResult
 	if err := json.Unmarshal([]byte(raw), &results); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to parse result: %v\nraw: %s\n", err, raw)
+		return nil, fmt.Errorf("failed to parse result: %w (raw: %s)", err, raw)
+	}
+	return results, nil
+}
+
+func main() {
+	timeout := flag.Duration("timeout", 45*time.Second, "Page load timeout")
+	outputJSON := flag.Bool("json", false, "Output raw JSON")
+	wait := flag.Duration("wait", 10*time.Second, "Time to wait after page load for ad scripts to initialise")
+	showVersion := flag.Bool("version", false, "Print version and exit")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: prof-prebid [flags] <url>\n\nFlags:\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("prof-prebid v%s\n", version)
+		return
+	}
+
+	if flag.NArg() < 1 {
+		flag.Usage()
 		os.Exit(1)
+	}
+	url := flag.Arg(0)
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		url = "https://" + url
+	}
+
+	// First attempt: headless (fast, no visible window).
+	results, err := fetchResults(url, false, *wait, *timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "headless error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// If nothing found, retry with a visible window to bypass stricter bot detection.
+	if len(results) == 0 {
+		fmt.Fprintln(os.Stderr, "headless: no results, retrying with headed browser...")
+		results, err = fetchResults(url, true, *wait, *timeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "headed error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if len(results) == 0 {
