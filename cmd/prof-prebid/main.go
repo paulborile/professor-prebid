@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -25,14 +28,31 @@ const safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_4) AppleWebKit/605
 const extractScript = `
 (function() {
 	// Detect known publisher wrapper / ad management platforms.
-	function detectPublisher() {
-		if (window.freestar && window.freestar.config) return 'Freestar';
-		if (window.freestar)                            return 'Freestar';
-		if (window.Browsi)                              return 'Browsi';
-		if (window.AdThrive)                            return 'AdThrive';
-		if (window.Mediavine)                           return 'Mediavine';
-		if (window.rp_account || window.rp)            return 'Raptive';
-		if (window.ntvConfig || window.ntv)             return 'Nativo';
+	// Checked via window globals first, then by PBS endpoint URL.
+	function detectPublisher(endpoint) {
+		if (window.freestar) return 'Freestar';
+		if (window.Browsi)   return 'Browsi';
+		if (window.AdThrive) return 'AdThrive';
+		if (window.Mediavine) return 'Mediavine';
+		if (window.rp_account || window.rp) return 'Raptive';
+		if (window.ntvConfig || window.ntv) return 'Nativo';
+
+		// Detect by PBS endpoint hostname.
+		var urls = [];
+		if (typeof endpoint === 'string') {
+			urls.push(endpoint);
+		} else if (endpoint && typeof endpoint === 'object') {
+			urls = Object.values(endpoint);
+		}
+		for (var i = 0; i < urls.length; i++) {
+			var u = urls[i] || '';
+			if (u.includes('a.bids.ws'))   return 'Teal';
+			if (u.includes('s2s.t13.io'))  return 'Freestar';
+			if (u.includes('prebid.adnxs.com')) return 'Xandr';
+			if (u.includes('prebid.rubiconproject.com') || u.includes('prebid-server.rubiconproject.com')) return 'Magnite';
+			if (u.includes('pbs.openx.net'))    return 'OpenX';
+			if (u.includes('prebid.media.net')) return 'Media.net';
+		}
 		return null;
 	}
 
@@ -46,7 +66,6 @@ const extractScript = `
 		} catch(e) {}
 	}
 
-	var publisher = detectPublisher();
 	var results = [];
 	namespaces.forEach(function(ns) {
 		var pbjs = window[ns];
@@ -58,7 +77,7 @@ const extractScript = `
 			results.push({
 				namespace: ns,
 				version: pbjs.version || 'unknown',
-				publisher: publisher,
+				publisher: detectPublisher(s2s.endpoint),
 				s2sConfig: s2s,
 			});
 		} catch(e) {}
@@ -105,6 +124,49 @@ func extractEndpoint(s2s any) string {
 		b, _ := json.Marshal(ep)
 		return string(b)
 	}
+}
+
+// adsTxtSignal maps a substring found in ads.txt to a publisher name.
+var adsTxtSignals = []struct {
+	substr    string
+	publisher string
+}{
+	{"managerdomain=freestar.com", "Freestar"},
+	{"freestar.com,", "Freestar"},
+	{"pub.network,", "Freestar"},
+	{"s2s.t13.io", "Freestar"},
+	{"teal.works,", "Teal"},
+	{"bids.ws,", "Teal"},
+	{"adthrive.com,", "AdThrive"},
+	{"mediavine.com,", "Mediavine"},
+	{"raptive.com,", "Raptive"},
+	{"casalemedia.com,", "Index Exchange"},
+}
+
+// fetchAdsTxt fetches /ads.txt for the given page URL and returns the detected publisher name (or "").
+func fetchAdsTxt(pageURL string) string {
+	u, err := url.Parse(pageURL)
+	if err != nil {
+		return ""
+	}
+	adsTxtURL := u.Scheme + "://" + u.Host + "/ads.txt"
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Get(adsTxtURL)
+	if err != nil || resp.StatusCode != 200 {
+		return ""
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return ""
+	}
+	lower := strings.ToLower(string(b))
+	for _, sig := range adsTxtSignals {
+		if strings.Contains(lower, sig.substr) {
+			return sig.publisher
+		}
+	}
+	return ""
 }
 
 // fetchResults launches a browser (headed or not) and returns the extracted s2sConfig results.
@@ -196,6 +258,12 @@ func main() {
 		url = "https://" + url
 	}
 
+	// Quick ads.txt check — no browser needed, runs in parallel with nothing yet.
+	adsTxtPublisher := fetchAdsTxt(url)
+	if adsTxtPublisher != "" {
+		fmt.Fprintf(os.Stderr, "ads.txt: detected %s\n", adsTxtPublisher)
+	}
+
 	// First attempt: headless (fast, no visible window).
 	results, err := fetchResults(url, false, *wait, *timeout)
 	if err != nil {
@@ -227,8 +295,14 @@ func main() {
 
 	for _, r := range results {
 		fmt.Printf("=== Prebid instance: %s (v%s) ===\n", r.Namespace, r.Version)
+		publisher := ""
 		if r.Publisher != nil {
-			fmt.Printf("Publisher wrapper: %s\n", *r.Publisher)
+			publisher = *r.Publisher
+		} else if adsTxtPublisher != "" {
+			publisher = adsTxtPublisher + " (ads.txt)"
+		}
+		if publisher != "" {
+			fmt.Printf("Publisher wrapper: %s\n", publisher)
 		}
 		fmt.Printf("Prebid Server URL: %s\n", extractEndpoint(r.S2SConfig))
 		pretty, _ := json.MarshalIndent(r.S2SConfig, "", "  ")
